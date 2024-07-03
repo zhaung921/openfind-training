@@ -1,7 +1,10 @@
 # Disk Hash
 
-## 執行方式:
-使用前須新增Hash_Table.txt以及Table_index.txt兩個文件  
+## 執行方式:  
+一開始可先執行Makefile，他會新增Hash_Table.txt以及Table_index.txt兩個文件，並且產生出mode執行檔  
+```./make```  
+若要刪除Hash_Table.txt以及Table_index.txt兩個資料，可執行  
+```./make clean```
 
 ### 要新增資料進hash table可執行指令:
 ```
@@ -9,10 +12,11 @@
 ```  
 
 ### 需要import可執行指令:
+filetype有binary與str兩個選項
 ```
 ./mode import [filename] [filetype] 
 ```
-filetype有binary與str兩個選項  
+  
 
 ### 要刪除可執行指令:  
 (此時並不會真正刪除資料只會先被標記為刪除，若要真正刪除需手動執行reset)  

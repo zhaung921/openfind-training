@@ -22,6 +22,8 @@
 #define MAX_KEY_LEN         256     
 #define SEED                0x12345678       //for hash function's begin hash value
 
+
+
 #define max(a, b) ((a) > (b) ? (a) : (b))
 
 int hash(char *currKey)

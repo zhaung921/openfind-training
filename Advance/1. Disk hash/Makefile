@@ -15,6 +15,5 @@ check_files:
 	@test -f Hash_Table.txt || touch Hash_Table.txt
 	@test -f Table_index.txt || touch Table_index.txt
 
-# 清理编译生成的文件
 clean:
 	rm -f $(TARGET) Hash_Table.txt Table_index.txt

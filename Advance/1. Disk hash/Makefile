@@ -1,12 +1,20 @@
-CC = gcc
+CC=gcc
 
-all: create protest
+CFLAGS=-g
 
-protest: diskHash.c
-	$(CC) -o mode diskHash.c mode.c
+TARGET=mode
 
-create:
-	touch ./Hash_Table.txt ./Table_index.txt
+SOURCES=mode.c diskHash.c
 
+all: $(TARGET) check_files
+
+$(TARGET): $(SOURCES)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCES)
+
+check_files:
+	@test -f Hash_Table.txt || touch Hash_Table.txt
+	@test -f Table_index.txt || touch Table_index.txt
+
+# 清理编译生成的文件
 clean:
-	rm -f ./Hash_Table.txt ./Table_index.txt
+	rm -f $(TARGET) Hash_Table.txt Table_index.txt

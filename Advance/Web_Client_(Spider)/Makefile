@@ -8,12 +8,17 @@ TARGET=web_client
 
 SOURCES=web_client.c
 
-LIB=ssl
+LIB=curl
 
-LIB2=crypto
+LIB2=xml2
 
-all: $(TARGET) 
+all: $(TARGET) creat_file
 
 $(TARGET): $(SOURCES)
-	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCES) $(LFLAG)$(LIB) $(LFLAG)$(LIB2)
+	$(CC) $(CFLAGS) -I/usr/include/libxml2 -o $(TARGET) $(SOURCES) $(LFLAG)$(LIB) $(LFLAG)$(LIB2)
+
+creat_file:
+	@test -d openfind_output || mkdir -p openfind_output
+clean:
+	rm -r openfind_output
 

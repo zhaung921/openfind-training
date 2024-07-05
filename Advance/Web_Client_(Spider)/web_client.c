@@ -1,263 +1,134 @@
-#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <netdb.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include <ctype.h>
+#include <curl/curl.h>
 
-#define BUFFER_SIZE 4096
+#define MAX_FILENAME 256
+#define MAX_URL_LENGTH 2048
 #define MAX_LINKS 1000
 
-typedef struct {
-    char url[1024];
-    char host[256];
-    char path[1024];
-    int port;
-    int is_https;
-} URL;
+struct MemoryStruct {
+    char *memory;
+    size_t size;
+};
 
-void parse_url(const char *url, URL *parsed_url) {
-    char *protocol = strstr(url, "://");
-    const char *host_start = protocol ? protocol + 3 : url;
-    
-    parsed_url->is_https = (strncmp(url, "https", 5) == 0);
-    parsed_url->port = parsed_url->is_https ? 443 : 80;
+static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t realsize = size * nmemb;
+    struct MemoryStruct *mem = (struct MemoryStruct *)userp;
 
-    const char *path_start = strchr(host_start, '/');
-    if (path_start) {
-        strncpy(parsed_url->host, host_start, path_start - host_start);
-        parsed_url->host[path_start - host_start] = '\0';
-        strcpy(parsed_url->path, path_start);
-    } else {
-        strcpy(parsed_url->host, host_start);
-        strcpy(parsed_url->path, "/");
+    char *ptr = realloc(mem->memory, mem->size + realsize + 1);
+    if(!ptr) {
+        printf("not enough memory (realloc returned NULL)\n");
+        return 0;
     }
 
-    strcpy(parsed_url->url, url);
+    mem->memory = ptr;
+    memcpy(&(mem->memory[mem->size]), contents, realsize);
+    mem->size += realsize;
+    mem->memory[mem->size] = 0;
+
+    return realsize;
 }
 
-int create_socket(const char *host, int port) {
-    struct addrinfo hints, *res, *p;
-    int sockfd;
-    char port_str[6];
-    snprintf(port_str, sizeof(port_str), "%d", port);
+void normalize_url(const char *base_url, const char *relative_url, char *result, size_t result_size) {
+    CURLU *url = curl_url();
+    curl_url_set(url, CURLUPART_URL, base_url, 0);
+    curl_url_set(url, CURLUPART_URL, relative_url, 0);
+    char *normalized;
+    curl_url_get(url, CURLUPART_URL, &normalized, 0);
+    strncpy(result, normalized, result_size);
+    result[result_size - 1] = '\0';
+    curl_free(normalized);
+    curl_url_cleanup(url);
+}
 
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
-        perror("getaddrinfo failed");
-        return -1;
-    }
-
-    for (p = res; p != NULL; p = p->ai_next) {
-        sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
-        if (sockfd == -1) continue;
-
-        if (connect(sockfd, p->ai_addr, p->ai_addrlen) != -1) {
-            break;
+void extract_links(const char *html_content, const char *base_url, char **links, int *link_count) {
+    const char *ptr = html_content;
+    while ((ptr = strstr(ptr, "href=\"")) != NULL) {
+        ptr += 6; // 跳過 "href=""
+        const char *end = strchr(ptr, '"');
+        if (end && *link_count < MAX_LINKS) {
+            int len = end - ptr;
+            char *link = malloc(len + 1);
+            strncpy(link, ptr, len);
+            link[len] = '\0';
+            
+            char normalized_url[MAX_URL_LENGTH];
+            normalize_url(base_url, link, normalized_url, sizeof(normalized_url));
+            links[*link_count] = strdup(normalized_url);
+            (*link_count)++;
+            
+            free(link);
         }
-
-        close(sockfd);
+        ptr = end + 1;
     }
-
-    freeaddrinfo(res);
-    return (p == NULL) ? -1 : sockfd;
 }
 
-SSL_CTX *create_ssl_context() {
-    const SSL_METHOD *method = TLS_client_method();
-    SSL_CTX *ctx = SSL_CTX_new(method);
-    if (!ctx) {
-        perror("Unable to create SSL context");
-        ERR_print_errors_fp(stderr);
-        exit(EXIT_FAILURE);
-    }
-    return ctx;
-}
+int crawl_url(const char *url, const char *output_dir, int is_original) {
+    CURL *curl_handle;
+    CURLcode res;
+    struct MemoryStruct chunk;
+    char filename[MAX_FILENAME];
+    FILE *fp;
 
-void init_openssl() {
-    SSL_load_error_strings();
-    OpenSSL_add_ssl_algorithms();
-}
+    chunk.memory = malloc(1);
+    chunk.size = 0;
 
-void cleanup_openssl() {
-    EVP_cleanup();
-}
+    curl_handle = curl_easy_init();
 
-int send_request(SSL *ssl, int sockfd, const URL *url) {
-    char request[BUFFER_SIZE];
-    int bytes_sent;
+    if(curl_handle) {
+        curl_easy_setopt(curl_handle, CURLOPT_URL, url);
+        curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+        curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
+        curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, "libcurl-agent/1.0");
 
-    snprintf(request, sizeof(request),
-             "GET %s HTTP/1.1\r\n"
-             "Host: %s\r\n"
-             "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36\r\n"
-             "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8\r\n"
-             "Accept-Language: zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7\r\n"
-             "Connection: close\r\n\r\n",
-             url->path, url->host);
+        res = curl_easy_perform(curl_handle);
 
-    if (url->is_https) {
-        bytes_sent = SSL_write(ssl, request, strlen(request));
-    } else {
-        bytes_sent = send(sockfd, request, strlen(request), 0);
-    }
-
-    return bytes_sent;
-}
-
-int receive_response(SSL *ssl, int sockfd, const char *output_dir, const URL *url, char **links, int *link_count) {
-    char buffer[BUFFER_SIZE];
-    int bytes_received;
-    FILE *file = NULL;
-    int chunked = 0;
-    int content_length = -1;
-    int body_started = 0;
-    int status_code = 0;
-    char filename[1024];
-    char *file_basename = strrchr(url->path, '/');
-    if (file_basename == NULL || *(file_basename + 1) == '\0') {
-        file_basename = "index.html";
-    } else {
-        file_basename++; // 跳過 '/'
-    }
-    snprintf(filename, sizeof(filename), "%s/%s", output_dir, file_basename);
-
-    // 創建輸出目錄（如果不存在）
-    char mkdir_command[1024];
-    snprintf(mkdir_command, sizeof(mkdir_command), "mkdir -p %s", output_dir);
-    system(mkdir_command);
-
-    file = fopen(filename, "w");
-    if (!file) {
-        perror("Failed to open output file");
-        fprintf(stderr, "Attempted to open file: %s\n", filename);
-        return -1;
-    }
-
-    while (1) {
-        if (url->is_https) {
-            bytes_received = SSL_read(ssl, buffer, sizeof(buffer) - 1);
+        if(res != CURLE_OK) {
+            fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
         } else {
-            bytes_received = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
-        }
+            long response_code;
+            curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &response_code);
+            printf("Crawling: %s (Response: %ld)\n", url, response_code);
 
-        if (bytes_received <= 0) break;
+            char *content_type;
+            curl_easy_getinfo(curl_handle, CURLINFO_CONTENT_TYPE, &content_type);
 
-        buffer[bytes_received] = '\0';
+            if (content_type && strstr(content_type, "text/html")) {
+                char *body_start = strstr(chunk.memory, "\r\n\r\n");
+                if (body_start) {
+                    body_start += 4; // 跳過 "\r\n\r\n"
 
-        if (!body_started) {
-            char *body_start = strstr(buffer, "\r\n\r\n");
-            if (body_start) {
-                body_started = 1;
-                body_start += 4;
+                    snprintf(filename, MAX_FILENAME, "%s/%p.html", output_dir, (void*)url);
+                    fp = fopen(filename, "wb");
+                    if(fp) {
+                        fwrite(body_start, 1, strlen(body_start), fp);
+                        fclose(fp);
+                        printf("Body content saved to: %s\n", filename);
+                    }
 
-                // Parse headers
-                char *status_line = strstr(buffer, "HTTP/1.1");
-                if (status_line) {
-                    sscanf(status_line, "HTTP/1.1 %d", &status_code);
+                    if (is_original) {
+                        char *links[MAX_LINKS];
+                        int link_count = 0;
+                        extract_links(body_start, url, links, &link_count);
+
+                        for (int i = 0; i < link_count; i++) {
+                            crawl_url(links[i], output_dir, 0);
+                            free(links[i]);
+                        }
+                    }
                 }
-
-                char *transfer_encoding = strcasestr(buffer, "Transfer-Encoding: chunked");
-                if (transfer_encoding) {
-                    chunked = 1;
-                }
-
-                char *content_length_header = strcasestr(buffer, "Content-Length:");
-                if (content_length_header) {
-                    sscanf(content_length_header, "Content-Length: %d", &content_length);
-                }
-
-                // Write body part to file
-                fwrite(body_start, 1, bytes_received - (body_start - buffer), file);
             } else {
-                continue;  // Still in headers, skip
+                printf("Skipping non-HTML content: %s\n", url);
             }
-        } else {
-            // Process body
-            fwrite(buffer, 1, bytes_received, file);
         }
 
-        // Parse HTML for links
-        char *link_start = buffer;
-        while ((link_start = strstr(link_start, "href=\"")) != NULL) {
-            link_start += 6;  // Move past href="
-            char *link_end = strchr(link_start, '"');
-            if (link_end && *link_count < MAX_LINKS) {
-                int link_length = link_end - link_start;
-                links[*link_count] = malloc(link_length + 1);
-                strncpy(links[*link_count], link_start, link_length);
-                links[*link_count][link_length] = '\0';
-                (*link_count)++;
-            }
-            link_start = link_end;
-        }
+        curl_easy_cleanup(curl_handle);
     }
 
-    fclose(file);
-    printf("Status Code: %d\n", status_code);
-    printf("Content saved to: %s\n", filename);
-    return status_code;
-}
+    free(chunk.memory);
 
-int crawl_url(const char *url, const char *output_dir) {
-    URL parsed_url;
-    parse_url(url, &parsed_url);
-
-    int sockfd = create_socket(parsed_url.host, parsed_url.port);
-    if (sockfd == -1) {
-        perror("Failed to create socket");
-        return -1;
-    }
-
-    SSL_CTX *ctx = NULL;
-    SSL *ssl = NULL;
-    if (parsed_url.is_https) {
-        ctx = create_ssl_context();
-        ssl = SSL_new(ctx);
-        SSL_set_fd(ssl, sockfd);
-        if (SSL_connect(ssl) <= 0) {
-            ERR_print_errors_fp(stderr);
-            SSL_free(ssl);
-            SSL_CTX_free(ctx);
-            close(sockfd);
-            return -1;
-        }
-    }
-
-    if (send_request(ssl, sockfd, &parsed_url) < 0) {
-        perror("Failed to send request");
-        if (parsed_url.is_https) {
-            SSL_free(ssl);
-            SSL_CTX_free(ctx);
-        }
-        close(sockfd);
-        return -1;
-    }
-
-    char *links[MAX_LINKS];
-    int link_count = 0;
-    int status_code = receive_response(ssl, sockfd, output_dir, &parsed_url, links, &link_count);
-
-    printf("Found %d links:\n", link_count);
-    for (int i = 0; i < link_count; i++) {
-        printf("%s\n", links[i]);
-        free(links[i]);
-    }
-
-    if (parsed_url.is_https) {
-        SSL_free(ssl);
-        SSL_CTX_free(ctx);
-    }
-    close(sockfd);
-
-    return status_code;
+    return 0;
 }
 
 int main(int argc, char *argv[]) {
@@ -269,9 +140,9 @@ int main(int argc, char *argv[]) {
     const char *start_url = argv[1];
     const char *output_dir = argv[2];
 
-    init_openssl();
-    int status = crawl_url(start_url, output_dir);
-    cleanup_openssl();
+    curl_global_init(CURL_GLOBAL_ALL);
+    int result = crawl_url(start_url, output_dir, 1);
+    curl_global_cleanup();
 
-    return (status >= 200 && status < 300) ? 0 : 1;
+    return result;
 }

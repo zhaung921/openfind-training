@@ -42,6 +42,7 @@ void normalize_url(const char *base_url, const char *relative_url, char *result,
     curl_url_cleanup(url);
 }
 
+
 void extract_links(const char *html_content, const char *base_url, char **links, int *link_count) {
     const char *ptr = html_content;
     while ((ptr = strstr(ptr, "href=\"")) != NULL) {

@@ -8,9 +8,9 @@ TARGET=web_client
 
 SOURCES=web_client.c
 
-LIB=curl
+LIB=ssl
 
-LIB2=xml2
+LIB2=crypto
 
 all: $(TARGET) creat_file
 

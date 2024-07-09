@@ -11,14 +11,28 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <sys/select.h>
+#include <pthread.h>
 
-#define MAX_FILENAME        256
-#define MAX_URL_LENGTH      2048
-#define MAX_LINKS           1000
-#define BUFFER_SIZE         4096
-#define MAX_VISITED_URLS    10000
-#define MAX_DEPTH           2
-#define MAX_RETRIES         3
+#define MAX_FILENAME            256
+#define MAX_URL_LENGTH          2048
+#define MAX_LINKS               1000
+#define BUFFER_SIZE             4096
+#define MAX_VISITED_URLS        10000
+#define MAX_DEPTH               2
+#define MAX_RETRIES             3
+#define NUM_THREADS             3
+
+#define SUCCESS                 0
+#define ERROR_BASE              0
+#define ERR_HTTP_STATUS         ERROR_BASE - 1
+#define ERR_NORMALIZE_URL       ERROR_BASE - 2
+#define ERR_GETADDRINFO_FAIL    ERROR_BASE - 3
+#define ERR_FAIL_CONNECT        ERROR_BASE - 4
+#define ERR_SEND_REQST_FAIL     ERROR_BASE - 5
+#define ERR_BODY_NOT_FOUND      ERROR_BASE - 6
+#define ERR_WRON_BODY_TAG       ERROR_BASE - 7
+#define ERR_FILE_OPEN_FAIL      ERROR_BASE - 8
+
 
 typedef struct {
 char scheme[8];
@@ -27,17 +41,17 @@ char path[1024];
 int port;
 } URL;
 
-SSL_CTX* create_ssl_context();
+SSL_CTX *create_ssl_context();
 SSL  *setup_ssl_connection(int sockfd, SSL_CTX **ctx);
 char *fetch_url(const char *url);
 void parse_url(const char *url, URL *parsed_url);
 int  connect_to_host(const char *hostname, int port);
 int  send_request(SSL *ssl, int sockfd, const URL *parsed_url);
 char *handle_response(SSL *ssl, int sockfd, const char *url);
-void normalize_url(const char *base_url, const char *rel_url, char *result, size_t result_size);
-void extract_links(const char *html_content, const char *base_url, char **links, int *link_count);
+int  normalize_url(const char *base_url, const char *rel_url, char *result, size_t result_size);
+int  extract_links(const char *html_content, const char *base_url, char **links, int *link_count);
 void create_filename(const char *url, char *filename, size_t filename_size);
-void save_body_content(const char *url, const char *content, const char *output_dir);
+int  save_body_content(const char *url, const char *content, const char *output_dir);
 int  is_url_visited(const char *url, char **visited_urls, int visited_count);
 void crawl_level(const char *base_url, const char *output_dir, int current_depth, char **visited_urls, int *visited_count);  
 
@@ -87,15 +101,14 @@ int connect_to_host(const char *hostname, int port)
 
     if ((status = getaddrinfo(hostname, port_str, &hints, &res)) != 0) 
     {
-        fprintf(stderr, "getaddrinfo error: %s\n", gai_strerror(status));
-        return -1;
+        printf("getaddrinfo error\n");
+        return ERR_GETADDRINFO_FAIL;
     }
 
     for(p = res; p != NULL; p = p->ai_next) 
     {
         if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1)
         {
-            perror("socket");
             continue;
         }
 
@@ -146,8 +159,8 @@ int connect_to_host(const char *hostname, int port)
 
     if (p == NULL) 
     {
-        fprintf(stderr, "Failed to connect to %s:%d\n", hostname, port);
-        return -1;
+        printf("Failed to connect to %s:%d\n", hostname, port);
+        return ERR_FAIL_CONNECT;
     }
 
     return sockfd;
@@ -158,9 +171,8 @@ SSL_CTX* create_ssl_context()
     const SSL_METHOD *method = TLS_client_method();
     SSL_CTX *ctx = SSL_CTX_new(method);
     if (!ctx) {
-        perror("Unable to create SSL context");
-        ERR_print_errors_fp(stderr);
-        exit(EXIT_FAILURE);
+        printf("Unable to create SSL context\n");
+        return NULL;
     }
     return ctx;
 }
@@ -201,7 +213,7 @@ int send_request(SSL *ssl, int sockfd, const URL *parsed_url)
     {
         bytes_sent = send(sockfd, request, strlen(request), 0);
     }
-    return bytes_sent > 0;
+    return bytes_sent > 0 ? SUCCESS:ERR_SEND_REQST_FAIL;
 }
 
 char *handle_response(SSL *ssl, int sockfd, const char *url) 
@@ -213,7 +225,8 @@ char *handle_response(SSL *ssl, int sockfd, const char *url)
     int status_code = 0;
     int headers_done = 0;
 
-    while (1) {
+    while (1) 
+    {
         if (ssl) 
         {
             bytes_received = SSL_read(ssl, buffer, sizeof(buffer) - 1);
@@ -330,7 +343,7 @@ char *fetch_url(const char *url)
    
     int bytes_sent=send_request(ssl, sockfd, &parsed_url);
 
-    if (bytes_sent <= 0) 
+    if (bytes_sent < 0) 
     {
         perror("Failed to send request");
         if (ssl) {
@@ -352,12 +365,13 @@ char *fetch_url(const char *url)
     return response;
 }
 
-void normalize_url(const char *base_url, const char *rel_url, char *result, size_t result_size) 
+int normalize_url(const char *base_url, const char *rel_url, char *result, size_t result_size) 
 {
     if (strncmp(rel_url, "http://", 7) == 0 || strncmp(rel_url, "https://", 8) == 0) 
     {
         strncpy(result, rel_url, result_size);
         result[result_size - 1] = '\0';
+        return SUCCESS;
     } 
 
     else if (rel_url[0] == '/') 
@@ -378,6 +392,7 @@ void normalize_url(const char *base_url, const char *rel_url, char *result, size
             {
                 snprintf(result, result_size, "%s%s", base_url, rel_url);
             }
+            return SUCCESS;
         }
     } 
     else 
@@ -390,15 +405,18 @@ void normalize_url(const char *base_url, const char *rel_url, char *result, size
             strncpy(result, base_url, base_len);
             result[base_len] = '\0';
             strncat(result, rel_url, result_size - base_len - 1);
+            return SUCCESS;
         } 
         else 
         {
             snprintf(result, result_size, "%s/%s", base_url, rel_url);
+            return SUCCESS;
         }
     }
+    return ERR_NORMALIZE_URL;
 }
 
-void extract_links(const char *html_content, const char *base_url, char **links, int *link_count) 
+int extract_links(const char *html_content, const char *base_url, char **links, int *link_count) 
 {
     const char *body_start = strstr(html_content, "<body");
     const char *body_end = strstr(html_content, "</body>");
@@ -407,7 +425,7 @@ void extract_links(const char *html_content, const char *base_url, char **links,
     {
         fprintf(stderr, "No valid body content found\n");
         *link_count = 0;
-        return;
+        return ERR_BODY_NOT_FOUND;
     }
 
     body_start = strchr(body_start, '>');
@@ -415,7 +433,7 @@ void extract_links(const char *html_content, const char *base_url, char **links,
     {
         fprintf(stderr, "Malformed body tag\n");
         *link_count = 0;
-        return;
+        return ERR_WRON_BODY_TAG;
     }
     body_start++;
 
@@ -476,6 +494,7 @@ void extract_links(const char *html_content, const char *base_url, char **links,
     }
 
     printf("Extracted %d links from body\n", *link_count);
+    return SUCCESS;
 }
 
 void create_filename(const char *url, char *filename, size_t filename_size) 
@@ -498,7 +517,7 @@ void create_filename(const char *url, char *filename, size_t filename_size)
     strcpy(filename + i, ".html");
 }
 
-void save_body_content(const char *url, const char *content, const char *output_dir) 
+int save_body_content(const char *url, const char *content, const char *output_dir) 
 {
     const char *body_start = strstr(content, "<body");
     const char *body_end = strstr(content, "</body>");
@@ -508,7 +527,7 @@ void save_body_content(const char *url, const char *content, const char *output_
         body_start = strchr(body_start, '>');
         if (body_start) 
         {
-            body_start++; // 移動到 body 標籤之後
+            body_start++; 
 
             char filename[MAX_FILENAME];
             create_filename(url, filename, sizeof(filename));
@@ -524,14 +543,18 @@ void save_body_content(const char *url, const char *content, const char *output_
             } 
             else 
             {
-                fprintf(stderr, "Failed to open file: %s\n", full_path);
+                printf("Failed to open file: %s\n", full_path);
+                return ERR_FILE_OPEN_FAIL;
+
             }
         }
     } 
     else 
     {
         fprintf(stderr, "No body content found in response from %s\n", url);
+        return ERR_BODY_NOT_FOUND;
     }
+    return SUCCESS;
 }
 
 int is_url_visited(const char *url, char **visited_urls, int visited_count) 

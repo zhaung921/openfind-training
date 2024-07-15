@@ -18,7 +18,7 @@
 #define MAX_LINKS               1000
 #define BUFFER_SIZE             4096
 #define MAX_VISITED_URLS        10000
-#define MAX_DEPTH               0
+#define MAX_DEPTH               2
 #define MAX_RETRIES             3
 #define NUM_THREADS             3
 #define MAX_REDIRECTS           10
@@ -34,28 +34,32 @@
 #define ERR_WRON_BODY_TAG       ERROR_BASE - 7
 #define ERR_FILE_OPEN_FAIL      ERROR_BASE - 8
 
-
 typedef struct {
-char scheme[8];
-char host[256];
-char path[1024];
-int port;
+    char scheme[8];
+    char host[256];
+    char path[1024];
+    int port;
 } URL;
 
-SSL_CTX *create_ssl_context();
-SSL  *setup_ssl_connection(int sockfd, SSL_CTX **ctx);
-char *fetch_url(const char *url, int redirect_count, char *final_url, size_t final_url_size);
-void parse_url(const char *url, URL *parsed_url);
-int  connect_to_host(const char *hostname, int port);
-int  send_request(SSL *ssl, int sockfd, const URL *parsed_url);
-char *handle_response(SSL *ssl, int sockfd, const char *url, int redirect_count, char *final_url, size_t final_url_size) ;
-int  normalize_url(const char *base_url, const char *rel_url, char *result, size_t result_size);
-int  extract_links(const char *html_content, const char *base_url, char **links, int *link_count);
-void create_filename(const char *url, char *filename, size_t filename_size);
-int  save_body_content(const char *url, const char *content, const char *output_dir);
-int  is_url_visited(const char *url, char **visited_urls, int visited_count);
-void crawl_level(const char *base_url, const char *output_dir, int current_depth, char **visited_urls, int *visited_count);  
+typedef struct {
+    char *data;
+    size_t length;
+    char content_type[256];
+} Content;
 
+SSL_CTX *create_ssl_context();
+SSL *setup_ssl_connection(int sockfd, SSL_CTX **ctx);
+Content* fetch_url(const char *url, int redirect_count, char *final_url, size_t final_url_size);
+void parse_url(const char *url, URL *parsed_url);
+int connect_to_host(const char *hostname, int port);
+int send_request(SSL *ssl, int sockfd, const URL *parsed_url);
+Content* handle_response(SSL *ssl, int sockfd, const char *url, int redirect_count, char *final_url, size_t final_url_size);
+int normalize_url(const char *base_url, const char *rel_url, char *result, size_t result_size);
+int extract_links(const char *html_content, const char *base_url, char **links, int *link_count);
+void create_filename(const char *url, const char *content_type, char *filename, size_t filename_size);
+int save_content(const char *url,  Content *content, const char *output_dir); 
+int is_url_visited(const char *url, char **visited_urls, int visited_count);
+void crawl_level(const char *base_url, const char *output_dir, int current_depth, char **visited_urls, int *visited_count);
 
 void parse_url(const char *url, URL *parsed_url) 
 {
@@ -113,15 +117,13 @@ int connect_to_host(const char *hostname, int port)
             continue;
         }
 
-        // set to block (wait connection)
         int flags = fcntl(sockfd, F_GETFL, 0);
         fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 
         int connect_result = connect(sockfd, p->ai_addr, p->ai_addrlen);
         if (connect_result == 0) 
         {
-            // connect success(immediately)
-            fcntl(sockfd, F_SETFL, flags);  // recover to nonblock
+            fcntl(sockfd, F_SETFL, flags);
             break;
         } 
         else if (errno != EINPROGRESS) 
@@ -134,20 +136,18 @@ int connect_to_host(const char *hostname, int port)
         struct timeval tv;
         FD_ZERO(&fdset);
         FD_SET(sockfd, &fdset);
-        tv.tv_sec = 10; //time out 10sec
+        tv.tv_sec = 10;
         tv.tv_usec = 0;
-        int select_result = select(sockfd + 1, NULL, &fdset, NULL, &tv);//check if socket can write 
+        int select_result = select(sockfd + 1, NULL, &fdset, NULL, &tv);
         if (select_result > 0) 
         {
-            // maybe connect success
             int so_error;
             socklen_t len = sizeof(so_error);
             getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &len);
             
             if (so_error == 0) 
             {
-                // connect sucessfully
-                fcntl(sockfd, F_SETFL, flags);  // recover to nonblock
+                fcntl(sockfd, F_SETFL, flags);
                 break;
             }
         }
@@ -213,18 +213,31 @@ int send_request(SSL *ssl, int sockfd, const URL *parsed_url)
     {
         bytes_sent = send(sockfd, request, strlen(request), 0);
     }
-    return bytes_sent > 0 ? SUCCESS:ERR_SEND_REQST_FAIL;
+    return bytes_sent > 0 ? SUCCESS : ERR_SEND_REQST_FAIL;
 }
 
-char *handle_response(SSL *ssl, int sockfd, const char *url, int redirect_count, char *final_url, size_t final_url_size) 
+Content* handle_response(SSL *ssl, int sockfd, const char *url, int redirect_count, char *final_url, size_t final_url_size) 
 {
     char buffer[BUFFER_SIZE];
     int bytes_received;
     int status_code = 0;
     int is_chunked = 0;
-    char *response = NULL;
+    Content *content = malloc(sizeof(Content));
+    if (!content) return NULL;
+    content->data = NULL;
+    content->length = 0;
+    content->content_type[0] = '\0';
+
     size_t response_size = 0;
     int headers_done = 0;
+    char *body_start = NULL;
+    
+    // 用於處理chunked傳輸
+    char *chunk_start = NULL;
+    size_t chunk_size = 0;
+    int reading_chunk_size = 0;
+    char chunk_size_str[20] = {0};
+    int chunk_size_str_pos = 0;
 
     while (1) 
     {
@@ -244,122 +257,166 @@ char *handle_response(SSL *ssl, int sockfd, const char *url, int redirect_count,
 
         buffer[bytes_received] = '\0';
 
-        char *new_response = realloc(response, response_size + bytes_received + 1);
-        if (!new_response) 
-        {
-            fprintf(stderr, "Memory allocation failed\n");
-            free(response);
-            return NULL;
-        }
-        response = new_response;
-        memcpy(response + response_size, buffer, bytes_received);
-        response_size += bytes_received;
-        response[response_size] = '\0';
-
         if (!headers_done) 
         {
-            char *header_end = strstr(response, "\r\n\r\n");
+            char *header_end = strstr(buffer, "\r\n\r\n");
             if (header_end) 
             {
                 headers_done = 1;
-                if (status_code == 0) 
-                {
-                    sscanf(response, "HTTP/1.1 %d", &status_code);
-                    printf("HTTP Status Code: %d\n", status_code);
+                body_start = header_end + 4;
+                
+                sscanf(buffer, "HTTP/1.1 %d", &status_code);
+                printf("HTTP Status Code: %d\n", status_code);
 
-                    if (status_code >= 300 && status_code < 400) 
+                if (status_code >= 300 && status_code < 400) 
+                {
+                    char new_location[MAX_URL_LENGTH] = {0};
+                    char *location = strstr(buffer, "Location: ");
+                    if (location) 
                     {
-                        char new_location[MAX_URL_LENGTH] = {0};
-                        char *location = strstr(response, "Location: ");
-                        if (location) 
+                        sscanf(location, "Location: %s", new_location);
+                        char full_url[MAX_URL_LENGTH];
+                        if (normalize_url(url, new_location, full_url, MAX_URL_LENGTH) == SUCCESS) 
                         {
-                            sscanf(location, "Location: %s", new_location);
-                            char full_url[MAX_URL_LENGTH];
-                            if (normalize_url(url, new_location, full_url, MAX_URL_LENGTH) == SUCCESS) 
-                            {
-                                printf("Redirecting to: %s\n", full_url);
-                                free(response);
-                                return fetch_url(full_url, redirect_count + 1, final_url, final_url_size);
-                            }
+                            printf("Redirecting to: %s\n", full_url);
+                            free(content->data);
+                            free(content);
+                            return fetch_url(full_url, redirect_count + 1, final_url, final_url_size);
                         }
                     }
-                    else if (status_code == 200)
-                    {
-                        strncpy(final_url, url, final_url_size);
-                        final_url[final_url_size - 1] = '\0';
-                    }
-                    else if (status_code >= 400) 
-                    {
-                        fprintf(stderr, "Error response: %d for URL %s\n", status_code, url);
-                        free(response);
-                        return NULL;
-                    }
+                }
+                else if (status_code == 200)
+                {
+                    strncpy(final_url, url, final_url_size);
+                    final_url[final_url_size - 1] = '\0';
+                }
+                else if (status_code >= 400) 
+                {
+                    fprintf(stderr, "Error response: %d for URL %s\n", status_code, url);
+                    free(content->data);
+                    free(content);
+                    return NULL;
                 }
 
-                if (strstr(response, "Transfer-Encoding: chunked") != NULL) 
+                char *content_type = strstr(buffer, "Content-Type: ");
+                if (content_type) 
+                {
+                    sscanf(content_type, "Content-Type: %255[^\r\n]", content->content_type);
+                }
+
+                if (strstr(buffer, "Transfer-Encoding: chunked") != NULL) 
                 {
                     is_chunked = 1;
                     printf("Detected chunked transfer encoding\n");
                 }
+
+                bytes_received -= (body_start - buffer);
+                chunk_start = body_start;
             }
+        }
+
+        if (is_chunked && headers_done) 
+        {
+            char *current = chunk_start;
+            while (current < buffer + bytes_received) 
+            {
+                if (chunk_size == 0) 
+                {
+                    // 讀取chunk大小
+                    while (*current != '\r' && current < buffer + bytes_received) 
+                    {
+                        if (chunk_size_str_pos < sizeof(chunk_size_str) - 1) 
+                        {
+                            chunk_size_str[chunk_size_str_pos++] = *current;
+                        }
+                        current++;
+                    }
+                    
+                    if (*current == '\r') 
+                    {
+                        chunk_size_str[chunk_size_str_pos] = '\0';
+                        sscanf(chunk_size_str, "%zx", &chunk_size);
+                        chunk_size_str_pos = 0;
+                        current += 2; // 跳過 \r\n
+                        
+                        if (chunk_size == 0) 
+                        {
+                            // 最後一個chunk
+                            break;
+                        }
+                    } 
+                    else 
+                    {
+                        // chunk大小不完整,等待更多數據
+                        break;
+                    }
+                }
+
+                // 讀取chunk數據
+                size_t remaining = buffer + bytes_received - current;
+                size_t to_copy = (chunk_size < remaining) ? chunk_size : remaining;
+                
+                char *new_data = realloc(content->data, response_size + to_copy);
+                if (!new_data) 
+                {
+                    fprintf(stderr, "Memory allocation failed\n");
+                    free(content->data);
+                    free(content);
+                    return NULL;
+                }
+                content->data = new_data;
+                
+                memcpy(content->data + response_size, current, to_copy);
+                response_size += to_copy;
+                current += to_copy;
+                chunk_size -= to_copy;
+
+                if (chunk_size == 0) 
+                {
+                    current += 2; // 跳過每個chunk後的 \r\n
+                }
+
+                chunk_start = current;
+            }
+        } 
+        else if (headers_done) 
+        {
+            // 非chunked數據的處理
+            char *new_data = realloc(content->data, response_size + bytes_received);
+            if (!new_data) 
+            {
+                fprintf(stderr, "Memory allocation failed\n");
+                free(content->data);
+                free(content);
+                return NULL;
+            }
+            content->data = new_data;
+            memcpy(content->data + response_size, body_start, bytes_received);
+            response_size += bytes_received;
+            body_start = buffer;
         }
     }
 
-    if (!response) 
+    if (!content->data) 
     {
         fprintf(stderr, "Failed to receive any data from %s\n", url);
+        free(content);
         return NULL;
     }
 
-    if (is_chunked) 
-    {
-        char *body_start = strstr(response, "\r\n\r\n");
-        if (body_start) 
-        {
-            body_start += 4;  // move to chunk body
-            char *decoded = malloc(response_size); 
-            if (!decoded) 
-            {
-                fprintf(stderr, "Memory allocation failed for decoding\n");
-                free(response);
-                return NULL;
-            }
-            
-            size_t decoded_size = 0;
-            char *chunk_start = body_start;
-            
-            // decode chunk
-            while (1) 
-            {
-                char *chunk_size_end = strstr(chunk_start, "\r\n");
-                if (!chunk_size_end) break;
-                
-                long chunk_size = strtol(chunk_start, NULL, 16);
-                if (chunk_size == 0) break;  // last chunk
-                
-                chunk_start = chunk_size_end + 2;  // move to chunk
-                memcpy(decoded + decoded_size, chunk_start, chunk_size);
-                decoded_size += chunk_size;
-                
-                chunk_start += chunk_size + 2;  // move to next chunk
-            }
-            
-            decoded[decoded_size] = '\0';  
-            
-            free(response);
-            return decoded;
-        }
-    }
+    content->length = response_size;
 
     printf("Successfully fetched URL: %s\n", url);
     printf("Final base URL after redirects: %s\n", final_url);
+    printf("Content-Type: %s\n", content->content_type);
+    printf("Total content length: %zu bytes\n", content->length);
 
-    return response;
+    return content;
 }
 
-char *fetch_url(const char *url, int redirect_count, char *final_url, size_t final_url_size)
+Content* fetch_url(const char *url, int redirect_count, char *final_url, size_t final_url_size)
 {
-    if(redirect_count>=MAX_REDIRECTS )//prevent unlimit redirection
+    if(redirect_count >= MAX_REDIRECTS)
     {
         printf("Max redirects reached for URL: %s\n", url);
         return NULL;
@@ -396,10 +453,10 @@ char *fetch_url(const char *url, int redirect_count, char *final_url, size_t fin
             close(sockfd);
             return NULL;
         }
-        ssl=setup_ssl_connection(sockfd, &ctx);
+        ssl = setup_ssl_connection(sockfd, &ctx);
     }
    
-    int bytes_sent=send_request(ssl, sockfd, &parsed_url);
+    int bytes_sent = send_request(ssl, sockfd, &parsed_url);
 
     if (bytes_sent < 0) 
     {
@@ -412,7 +469,7 @@ char *fetch_url(const char *url, int redirect_count, char *final_url, size_t fin
         return NULL;
     }
 
-    char* response = handle_response(ssl, sockfd, url, redirect_count, final_url, final_url_size);
+    Content* content = handle_response(ssl, sockfd, url, redirect_count, final_url, final_url_size);
     if (ssl) 
     {
         SSL_free(ssl);
@@ -420,7 +477,7 @@ char *fetch_url(const char *url, int redirect_count, char *final_url, size_t fin
     }
     close(sockfd);
 
-    return response;
+    return content;
 }
 
 int normalize_url(const char *base_url, const char *rel_url, char *result, size_t result_size) 
@@ -441,7 +498,7 @@ int normalize_url(const char *base_url, const char *rel_url, char *result, size_
     } 
     else 
     {
-        const char *path_end = strrchr(base_parsed.path, '/'); //last '/'
+        const char *path_end = strrchr(base_parsed.path, '/');
         if (path_end)
         {
             size_t base_path_len = path_end - base_parsed.path + 1;
@@ -484,7 +541,7 @@ int extract_links(const char *html_content, const char *base_url, char **links, 
 
     while (ptr < body_end && (ptr = strstr(ptr, "<a ")) != NULL) 
     {
-        ptr += 2; // move after 
+        ptr += 2; // move after "<a"
         const char *href = strstr(ptr, "href=");
         if (!href || href >= body_end) continue;
 
@@ -494,7 +551,7 @@ int extract_links(const char *html_content, const char *base_url, char **links, 
 
         if (quote != '"' && quote != '\'') 
         {
-            end = strpbrk(href, " >");//maybe stop at " " or ">"
+            end = strpbrk(href, " >");
         } 
         else 
         {
@@ -532,12 +589,12 @@ int extract_links(const char *html_content, const char *base_url, char **links, 
     return SUCCESS;
 }
 
-void create_filename(const char *url, char *filename, size_t filename_size) 
+void create_filename(const char *url, const char *content_type, char *filename, size_t filename_size) 
 {
     const char *start = strstr(url, "://");
     start = start ? start + 3 : url;
     size_t i = 0;
-    while (*start && i < filename_size - 5)// -5 for ".html" and null terminator
+    while (*start && i < filename_size - 5)
     { 
         if (*start == '/' || *start == '?' || *start == '&' || *start == '=') 
         {
@@ -549,51 +606,55 @@ void create_filename(const char *url, char *filename, size_t filename_size)
         }
         start++;
     }
-    strcpy(filename + i, ".html");
+    
+    const char *extension = ".bin";
+    if (strstr(content_type, "text/html")) 
+    {
+        extension = ".html";
+    } 
+    else if (strstr(content_type, "application/pdf")) 
+    {
+        extension = ".pdf";
+    } 
+    else if (strstr(content_type, "image/jpeg")) 
+    {
+        extension = ".jpg";
+    } 
+    else if (strstr(content_type, "application/msword")) 
+    {
+        extension = ".doc";
+    }
+    
+    strncpy(filename + i, extension, filename_size - i);
+    filename[filename_size - 1] = '\0';
 }
 
-int save_body_content(const char *url, const char *content, const char *output_dir) 
+int save_content(const char *url,  Content *content, const char *output_dir) 
 {
-    const char *body_start = strstr(content, "<body");
-    const char *body_end = strstr(content, "</body>");
-    if (body_start && body_end && body_end > body_start) 
+    char filename[MAX_FILENAME];
+    create_filename(url, content->content_type, filename, sizeof(filename));
+    
+    char full_path[MAX_FILENAME * 2];
+    snprintf(full_path, sizeof(full_path), "%s/%s", output_dir, filename);
+    char *begin = content->data;
+    
+    FILE *fp = fopen(full_path, "wb");
+    if (fp) 
     {
-        body_start = strchr(body_start, '>');
-        if (body_start) 
-        {
-            body_start++; 
-
-            char filename[MAX_FILENAME];
-            create_filename(url, filename, sizeof(filename));
-            char full_path[MAX_FILENAME * 2];
-            snprintf(full_path, sizeof(full_path), "%s/%s", output_dir, filename);
-        
-            FILE *fp = fopen(full_path, "w");
-            if (fp) 
-            {
-                fwrite(body_start, 1, body_end - body_start, fp);
-                fclose(fp);
-                printf("Body content saved to: %s\n", full_path);
-            } 
-            else 
-            {
-                printf("Failed to open file: %s\n", full_path);
-                return ERR_FILE_OPEN_FAIL;
-
-            }
-        }
+        fwrite(content->data, 1, content->length-(content->data-begin), fp);
+        fclose(fp);
+        printf("Content saved to: %s\n", full_path);
+        return SUCCESS;
     } 
     else 
     {
-        fprintf(stderr, "No body content found in response from %s\n", url);
-        return ERR_BODY_NOT_FOUND;
+        printf("Failed to open file: %s\n", full_path);
+        return ERR_FILE_OPEN_FAIL;
     }
-    return SUCCESS;
 }
 
 int is_url_visited(const char *url, char **visited_urls, int visited_count) 
 {
-    printf("%d\n",visited_count);
     for (int i = 0; i < visited_count; i++) 
     {
         if (strcmp(url, visited_urls[i]) == 0) 
@@ -606,65 +667,57 @@ int is_url_visited(const char *url, char **visited_urls, int visited_count)
 
 void crawl_level(const char *start_url, const char *output_dir, int current_depth, char **visited_urls, int *visited_count)  
 {
+    if (current_depth > MAX_DEPTH || *visited_count >= MAX_VISITED_URLS) {
+        return;
+    }
+
     char base_url[MAX_URL_LENGTH];
     strncpy(base_url, start_url, MAX_URL_LENGTH);
     base_url[MAX_URL_LENGTH - 1] = '\0';
 
-    char *response = fetch_url(start_url, 0, base_url, MAX_URL_LENGTH);
-    printf("aaaaa%s\n",response);
-    if (!response) 
+    if (is_url_visited(start_url, visited_urls, *visited_count)) {
+        printf("URL already visited: %s\n", start_url);
+        return;
+    }
+
+    visited_urls[*visited_count] = strdup(start_url);
+    (*visited_count)++;
+
+    Content *content = fetch_url(start_url, 0, base_url, MAX_URL_LENGTH);
+    if (!content) 
     {
         printf("Failed to fetch: %s\n", start_url);
         return;
     }
 
     printf("Successfully fetched URL: %s\n", base_url);
-    printf("Final base URL after redirects: %s\n", base_url);
+    printf("Content-Type: %s\n", content->content_type);
     
-    save_body_content(base_url, response, output_dir);
+    save_content(base_url, content, output_dir);
 
-    char *links[MAX_LINKS];
-    int link_count = 0;
-    extract_links(response, base_url, links, &link_count);
-
-    printf("Found %d links in %s\n", link_count, base_url);
-
-    for (int i = 0; i < link_count; i++) 
+    if (strstr(content->content_type, "text/html")) 
     {
-        char full_url[MAX_URL_LENGTH];
-        if (normalize_url(base_url, links[i], full_url, MAX_URL_LENGTH) == SUCCESS)
+        char *links[MAX_LINKS];
+        int link_count = 0;
+        extract_links(content->data, base_url, links, &link_count);
+
+        printf("Found %d links in %s\n", link_count, base_url);
+
+        for (int i = 0; i < link_count; i++) 
         {
-            printf("Processing link %d of %d: %s\n", i+1, link_count, full_url);
-            if (!is_url_visited(full_url, visited_urls, *visited_count))
+            char full_url[MAX_URL_LENGTH];
+            if (normalize_url(base_url, links[i], full_url, MAX_URL_LENGTH) == SUCCESS)
             {
-                visited_urls[*visited_count] = strdup(full_url);
-                (*visited_count)++;
-                if (current_depth < MAX_DEPTH)
-                {
-                    crawl_level(full_url, output_dir, current_depth + 1, visited_urls, visited_count);
-                }
+                crawl_level(full_url, output_dir, current_depth + 1, visited_urls, visited_count);
             }
-            char new_base_url[MAX_URL_LENGTH];
-            char *next_response = fetch_url(full_url, 0, new_base_url, MAX_URL_LENGTH);
-            if (next_response) 
-            {
-                save_body_content(new_base_url, next_response, output_dir);
-                free(next_response);
-            }
-            else
-            {
-                printf("Failed to fetch link: %s\n", full_url);
-            }
+            free(links[i]);
         }
     }
 
-    for (int i = 0; i < link_count; i++) 
-    {
-        free(links[i]);
-    }
-    free(response);
+    free(content->data);
+    free(content);
 
-    printf("Exiting crawl_level for URL: %s (Depth: %d)\n", base_url, current_depth);
+    printf("Finished crawling: %s (Depth: %d)\n", start_url, current_depth);
 }
 
 int main(int argc, char *argv[]) 
@@ -678,7 +731,6 @@ int main(int argc, char *argv[])
     const char *start_url = argv[1];
     const char *output_dir = argv[2];
 
-    // init OpenSSL
     SSL_library_init();
     OpenSSL_add_all_algorithms();
     SSL_load_error_strings();
@@ -688,14 +740,17 @@ int main(int argc, char *argv[])
     {
         mkdir(output_dir, 0700);
     }
-    char* visited_url[MAX_VISITED_URLS]={0};
+    char* visited_url[MAX_VISITED_URLS] = {0};
     int visited_count = 0;
 
     crawl_level(start_url, output_dir, 1, visited_url, &visited_count);
 
-    // clear OpenSSL
     EVP_cleanup();
     ERR_free_strings();
+
+    for (int i = 0; i < visited_count; i++) {
+        free(visited_url[i]);
+    }
 
     return 0;
 }

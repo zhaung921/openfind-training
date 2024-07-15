@@ -10,11 +10,13 @@ Web Client (Spider)
 5.	同時可執行 3 個 spider 程式已加快資料抓取速度  
 
 程式呼叫方式：  
+```
 ./web_client  [Start URL]  [Output Directory]  
-
-舉例：  
+```
+舉例： 
+```
 ./web_client  https://www.openfind.com/  webpage/  
-
+```
 設計順序：  
 1.	完成 Http(s) 連線，並且成功發送 HTTP Request 以及得到 Response 結果  
 1.1	連線至 www.openfin.com (port: 80 or port: 443)  

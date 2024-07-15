@@ -1,5 +1,5 @@
 # 題目:  
-Web Client (Spider)  
+## Web Client (Spider)  
 請撰寫一個程式來複製指定網站內所有網頁資料  
 
 條件如下：  
@@ -31,7 +31,7 @@ Web Client (Spider)
 3.1.1	要抓取哪一個連結、抓到網頁要怎麼處理、避免重複抓取  
 3.2	Implement  
 
-
+## 程式架構(不包含multi thread)  
 ![image](https://github.com/user-attachments/assets/891423bd-d17e-438a-995f-ce3413a85ee7)
 
 

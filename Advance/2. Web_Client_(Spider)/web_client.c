@@ -33,6 +33,7 @@
 #define ERR_FAIL_CRAWL_LEVEL    ERROR_BASE - 7
 #define ERR_FAIL_MALLOC         ERROR_BASE - 9
 #define ERR_OUT_OF_RANGE        ERROR_BASE - 10
+#define ERR_ARGUMENTS           ERROR_BASE - 11
 
 typedef struct {
     char scheme[8];
@@ -659,7 +660,7 @@ int main(int argc, char *argv[])
     if (argc != 3) 
     {
         fprintf(stderr, "Usage: %s [Start URL] [Output Directory]\n", argv[0]);
-        return 1;
+        return ERR_ARGUMENTS;
     }
 
     const char *start_url = argv[1];

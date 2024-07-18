@@ -18,9 +18,13 @@
 #define MAX_VISITED_URLS        10000
 #define MAX_DEPTH               2
 #define MAX_RETRIES             3
-#define NUM_THREADS             3
+#define NUM_CHILD               3
 #define MAX_REDIRECTS           10
-#define OVERLAP_SIZE            100  
+#define OVERLAP_SIZE            10
+#define MAX_SCHEME_SIZE         8
+#define MAX_HOST_SIZE           256
+#define MAX_PATH_SIZE           104
+#define MAX_CONTENT_TYPE_SIZE   256
 
 #define SUCCESS                 0
 #define ERROR_BASE              0
@@ -34,17 +38,18 @@
 #define ERR_FAIL_MALLOC         ERROR_BASE - 9
 #define ERR_OUT_OF_RANGE        ERROR_BASE - 10
 #define ERR_ARGUMENTS           ERROR_BASE - 11
+#define ERR_FORK_FAIL           ERROR_BASE - 12
 
 typedef struct {
-    char scheme[8];
-    char host[256];
-    char path[1024];
+    char scheme[MAX_SCHEME_SIZE];
+    char host[MAX_HOST_SIZE];
+    char path[MAX_PATH_SIZE];
     int port;
 } URL;
 
 typedef struct {
     size_t length;
-    char content_type[256];
+    char content_type[MAX_CONTENT_TYPE_SIZE];
     char filename[MAX_FILENAME];
 } Content;
 
@@ -52,20 +57,20 @@ typedef struct {
     char urls[MAX_LINKS][MAX_URL_LENGTH];
     int visited[MAX_LINKS];  // 0 havent visit，1 visited
     int count;
-} Link_storage;
+} link_storage;
 
 SSL_CTX *create_ssl_context();
 void parse_url(const char *url, URL *parsed_url);
 int connect_to_host(const char *hostname, int port);
 SSL *setup_ssl_connection(int sockfd, SSL_CTX **ctx);
-int is_url_visited(const char *url, Link_storage *pool) ;
+int is_url_visited(const char *url, link_storage *pool) ;
 int send_request(SSL *ssl, int sockfd, const URL *parsed_url);
 int normalize_url(const char *base_url, const char *rel_url, char *result, size_t result_size);
 void create_filename(const char *url, const char *content_type, char *filename, size_t filename_size);
-int crawl_level(const char *start_url, const char *output_dir, int current_depth, Link_storage *pool);
-Content* fetch_url(const char *url, int redirect_count, char *final_url, size_t final_url_size, const char *output_dir, Link_storage *links);
-int extract_links(const char *html_content, size_t content_length, const char *base_url, Link_storage *pool, char *overlap_buffer, size_t *overlap_size);
-Content* handle_response(SSL *ssl, int sockfd, const char *url, int redirect_count, char *final_url, size_t final_url_size, const char *output_dir, Link_storage *links);
+int crawl_level(const char *start_url, const char *output_dir, int current_depth, link_storage *pool);
+Content* fetch_url(const char *url, int redirect_count, char *final_url, size_t final_url_size, const char *output_dir, link_storage *links);
+int extract_links(const char *html_content, size_t content_length, const char *base_url, link_storage *pool, char *overlap_buffer, size_t *overlap_size);
+Content* handle_response(SSL *ssl, int sockfd, const char *url, int redirect_count, char *final_url, size_t final_url_size, const char *output_dir, link_storage *links);
 
 void parse_url(const char *url, URL *parsed_url) 
 {
@@ -213,7 +218,7 @@ int send_request(SSL *ssl, int sockfd, const URL *parsed_url)
     return bytes_sent > 0 ? SUCCESS : ERR_SEND_REQST_FAIL;
 }
 
-Content* handle_response(SSL *ssl, int sockfd, const char *url, int redirect_count, char *final_url, size_t final_url_size, const char *output_dir, Link_storage *pool) 
+Content* handle_response(SSL *ssl, int sockfd, const char *url, int redirect_count, char *final_url, size_t final_url_size, const char *output_dir, link_storage *pool) 
 {
     char buffer[BUFFER_SIZE];
     int bytes_received;
@@ -401,7 +406,7 @@ Content* handle_response(SSL *ssl, int sockfd, const char *url, int redirect_cou
     return content;
 }
 
-Content* fetch_url(const char *url, int redirect_count, char *final_url, size_t final_url_size, const char *output_dir, Link_storage *pool)
+Content* fetch_url(const char *url, int redirect_count, char *final_url, size_t final_url_size, const char *output_dir, link_storage *pool)
 {
     if(redirect_count >= MAX_REDIRECTS)
     {
@@ -500,7 +505,7 @@ int normalize_url(const char *base_url, const char *rel_url, char *result, size_
     return ERR_NORMALIZE_URL;
 }
 
-int extract_links(const char *html_content, size_t content_length, const char *base_url, Link_storage *pool, char *overlap_buffer, size_t *overlap_size) 
+int extract_links(const char *html_content, size_t content_length, const char *base_url, link_storage *pool, char *overlap_buffer, size_t *overlap_size) 
 {
     // deal with overlap
     char *combined = malloc(OVERLAP_SIZE + content_length + 1);
@@ -603,7 +608,7 @@ void create_filename(const char *url, const char *content_type, char *filename, 
     filename[filename_size - 1] = '\0';
 }
 
-int is_url_visited(const char *url, Link_storage *pool) 
+int is_url_visited(const char *url, link_storage *pool) 
 {
     for (int i = 0; i < pool->count; i++) 
     {
@@ -612,7 +617,7 @@ int is_url_visited(const char *url, Link_storage *pool)
     return 0;
 }
 
-int crawl_level(const char *start_url, const char *output_dir, int current_depth, Link_storage *pool)  
+int crawl_level(const char *start_url, const char *output_dir, int current_depth, link_storage *pool)  
 {
     if (current_depth > MAX_DEPTH || pool->count >= MAX_VISITED_URLS) return ERR_OUT_OF_RANGE;
 
@@ -673,7 +678,7 @@ int main(int argc, char *argv[])
     struct stat st = {0}; //for file state
     if (stat(output_dir, &st) == -1) mkdir(output_dir, 0700); //to get file state
     
-    Link_storage pool;
+    link_storage pool;
     for (int i = 0; i < MAX_LINKS; i++) 
     {
         pool.urls[i][0] = '\0';
@@ -681,6 +686,7 @@ int main(int argc, char *argv[])
     }
     pool.count = 0;
     int rev=crawl_level(start_url, output_dir, 1, &pool);
+    
     EVP_cleanup();
     ERR_free_strings();
     if(rev!=SUCCESS)

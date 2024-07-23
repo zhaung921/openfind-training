@@ -10,6 +10,10 @@
 #include <openssl/err.h>
 #include <sys/select.h>
 #include <pthread.h>
+#include <semaphore.h>
+#include <sys/mman.h>
+#include <bits/waitflags.h>
+#include <sys/wait.h> 
 
 #define MAX_FILENAME            256
 #define MAX_URL_LENGTH          2048
@@ -25,6 +29,17 @@
 #define MAX_HOST_SIZE           256
 #define MAX_PATH_SIZE           104
 #define MAX_CONTENT_TYPE_SIZE   256
+#define MAX_WAIT_COUNT          100
+#define HAVEN_VISITED           0
+#define NOT_FOUND               0
+#define FOUND                   1
+#define DELIVERING              1
+#define VISITING                2
+#define VISITED                 3
+#define VISITED_FAIL            4
+
+#define SHM_NAME "/web_crawler_shm"
+#define SEM_NAME "/web_crawler_sem"
 
 #define SUCCESS                 0
 #define ERROR_BASE              0
@@ -39,6 +54,11 @@
 #define ERR_OUT_OF_RANGE        ERROR_BASE - 10
 #define ERR_ARGUMENTS           ERROR_BASE - 11
 #define ERR_FORK_FAIL           ERROR_BASE - 12
+#define ERR_SHM_OPEN_FAIL       ERROR_BASE - 13
+#define ERR_SEM_OPEN_FAIL       ERROR_BASE - 14
+#define ERR_MAP_FAIL            ERROR_BASE - 15
+#define ERR_CREAT_CHILD         ERROR_BASE - 16
+#define ERR_INIT_SHM            ERROR_BASE - 17
 
 typedef struct {
     char scheme[MAX_SCHEME_SIZE];
@@ -55,22 +75,181 @@ typedef struct {
 
 typedef struct {
     char urls[MAX_LINKS][MAX_URL_LENGTH];
-    int visited[MAX_LINKS];  // 0 havent visit，1 visited
+    int state[MAX_LINKS];  // 0 havent visit, 1 delivering, 2 visiting, 3 visited, 4 fail
+    int depth[MAX_LINKS];
     int count;
+    char mutex_name[256];
+    int ready;
 } link_storage;
 
+sem_t *mutex;
+link_storage *shared_pool;
+int init_shared_resources() ;
 SSL_CTX *create_ssl_context();
+
+int has_unprocessed_urls();
+void parent_process(const char *start_url);
+int create_child_processes(const char *output_dir);
 void parse_url(const char *url, URL *parsed_url);
+void child_process(int child_id, const char *output_dir);
 int connect_to_host(const char *hostname, int port);
 SSL *setup_ssl_connection(int sockfd, SSL_CTX **ctx);
-int is_url_visited(const char *url, link_storage *pool) ;
+int is_url_visited(const char *url) ;
 int send_request(SSL *ssl, int sockfd, const URL *parsed_url);
 int normalize_url(const char *base_url, const char *rel_url, char *result, size_t result_size);
 void create_filename(const char *url, const char *content_type, char *filename, size_t filename_size);
-int crawl_level(const char *start_url, const char *output_dir, int current_depth, link_storage *pool);
-Content* fetch_url(const char *url, int redirect_count, char *final_url, size_t final_url_size, const char *output_dir, link_storage *links);
-int extract_links(const char *html_content, size_t content_length, const char *base_url, link_storage *pool, char *overlap_buffer, size_t *overlap_size);
-Content* handle_response(SSL *ssl, int sockfd, const char *url, int redirect_count, char *final_url, size_t final_url_size, const char *output_dir, link_storage *links);
+int crawl_level(const char *start_url, const char *output_dir, int current_depth);
+Content* fetch_url(int current_depth, const char *url, int redirect_count, char *final_url, size_t final_url_size, const char *output_dir);
+int extract_links(int current_depth, const char *html_content, size_t content_length, const char *base_url, char *overlap_buffer, size_t *overlap_size);
+Content* handle_response(int current_depth, SSL *ssl, int sockfd, const char *url, int redirect_count, char *final_url, size_t final_url_size, const char *output_dir);
+
+int init_shared_resources() 
+{
+    // creat share memory
+    int shm_fd = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) 
+    {
+        perror("Error shm_open failed\n");
+        return ERR_SHM_OPEN_FAIL;
+    }
+    
+    ftruncate(shm_fd, sizeof(link_storage));
+    
+    shared_pool = mmap(0, sizeof(link_storage), PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shared_pool == MAP_FAILED) 
+    {
+        printf("Error mmap failed\n");
+        return ERR_MAP_FAIL;
+    }
+    // initial link_storage
+    memset(shared_pool, 0, sizeof(link_storage));
+    strcpy(shared_pool->mutex_name, SEM_NAME);
+    shared_pool->ready = 0;
+    // creat posix semaphore
+    mutex = sem_open(SEM_NAME, O_CREAT, 0666, 1);
+    if (mutex == SEM_FAILED) 
+    {
+        perror("Error sem_open failed\n");
+        return ERR_SEM_OPEN_FAIL;
+    }
+    
+    return SUCCESS;
+}
+
+int create_child_processes(const char *output_dir) 
+{
+    for (int i = 0; i < NUM_CHILD; i++) 
+    {
+        pid_t pid = fork();
+        if (pid == -1) 
+        {
+            perror("fork failed");
+            return ERR_FORK_FAIL;
+        } 
+        else if (pid == 0) 
+        {
+            // wait for ready
+            while (1) 
+            {
+                sem_wait(mutex);
+                if (shared_pool->ready)
+                {
+                    sem_post(mutex);
+                    break;
+                }
+                sem_post(mutex);
+                usleep(1000); 
+            }
+            child_process(i, output_dir);
+        }
+    }
+    return SUCCESS;
+}
+
+void parent_process(const char *start_url) 
+{
+    int active_children = NUM_CHILD;
+    int urls_to_process = 1; 
+
+    while (active_children > 0) 
+    {
+        sem_wait(mutex);    // search url and set to deliver
+        for (int i = 0; i < shared_pool->count && i < MAX_LINKS; i++) 
+        {
+            if (shared_pool->state[i] == HAVEN_VISITED) 
+            {
+                shared_pool->state[i] = DELIVERING;  
+                urls_to_process++;
+                printf("Parent set URL %s (index: %d) to DELIVERING\n", shared_pool->urls[i], i);
+            }
+        }
+        sem_post(mutex);
+
+        // check finish child
+        int status;
+        pid_t finished_pid = waitpid(-1, &status, WNOHANG);
+        if (finished_pid > 0) 
+        {
+            active_children--;
+            printf("Child process %d has finished.\n", finished_pid);
+        }
+    }
+    printf("All URLs have been processed.\n");
+}
+
+void child_process(int child_id, const char *output_dir) 
+{
+    printf("Child %d started\n", child_id);
+    int wait_count = 0;
+    while (1) 
+    {
+        char url[MAX_URL_LENGTH];
+        int url_index = -1;
+        int current_depth = -1;
+        sem_wait(mutex);
+        for (int i = 0; i < shared_pool->count && i < MAX_LINKS; i++) 
+        {
+            if (shared_pool->state[i] == DELIVERING && shared_pool->depth[i] <= MAX_DEPTH) 
+            {  
+                url_index = i;
+                current_depth = shared_pool->depth[i];
+                strncpy(url, shared_pool->urls[i], MAX_URL_LENGTH - 1);
+                url[MAX_URL_LENGTH - 1] = '\0';
+                shared_pool->state[i] = VISITING;  
+                printf("Child %d picked URL: %s (index: %d)\n", child_id, url, i);
+                break;
+            } 
+        }
+        sem_post(mutex);
+
+        if (url_index == -1) 
+        {
+            printf("Child %d found no more URLs to process\n", child_id);
+            usleep(100000);
+            wait_count ++;
+            if(wait_count>MAX_WAIT_COUNT||has_unprocessed_urls() == NOT_FOUND ) exit(0); 
+            continue;  
+        }
+
+        printf("Child %d processing URL: %s\n", child_id, url);
+        int result = crawl_level(url, output_dir, current_depth);
+
+        sem_wait(mutex);
+        if (result == SUCCESS) 
+        {
+            shared_pool->state[url_index] = VISITED;
+            printf("Child %d successfully processed URL: %s\n", child_id, url);
+        } 
+        else 
+        {
+            shared_pool->state[url_index] = VISITED_FAIL;  
+            printf("Child %d failed to fetch URL: %s\n", child_id, url);
+        }
+        sem_post(mutex);
+
+        printf("Child %d finished processing URL: %s\n", child_id, url);
+    }
+}
 
 void parse_url(const char *url, URL *parsed_url) 
 {
@@ -83,7 +262,6 @@ void parse_url(const char *url, URL *parsed_url)
     } 
     else strcpy(parsed_url->scheme, "http");
     
-
     const char *path_start = strchr(url, '/');
     if (path_start) 
     {
@@ -218,7 +396,7 @@ int send_request(SSL *ssl, int sockfd, const URL *parsed_url)
     return bytes_sent > 0 ? SUCCESS : ERR_SEND_REQST_FAIL;
 }
 
-Content* handle_response(SSL *ssl, int sockfd, const char *url, int redirect_count, char *final_url, size_t final_url_size, const char *output_dir, link_storage *pool) 
+Content* handle_response(int current_depth, SSL *ssl, int sockfd, const char *url, int redirect_count, char *final_url, size_t final_url_size, const char *output_dir) 
 {
     char buffer[BUFFER_SIZE];
     int bytes_received;
@@ -279,7 +457,7 @@ Content* handle_response(SSL *ssl, int sockfd, const char *url, int redirect_cou
                         {
                             printf("Redirecting to: %s\n", full_url);
                             free(content);
-                            return fetch_url(full_url, redirect_count + 1, final_url, final_url_size, output_dir, pool);
+                            return fetch_url(current_depth, full_url, redirect_count + 1, final_url, final_url_size, output_dir);
                         }
                     }
                 }
@@ -348,9 +526,9 @@ Content* handle_response(SSL *ssl, int sockfd, const char *url, int redirect_cou
                                 size_t write_size = (remaining_chunk_size < remaining_bytes) ? remaining_chunk_size : remaining_bytes;
                                 fwrite(current_pos, 1, write_size, fp);
                                 content->length += write_size;
-                                if (strstr(content->content_type, "text/html"))
+                                if (strstr(content->content_type, "text/html") && current_depth + 1 <= MAX_DEPTH)
                                 {
-                                    extract_links(current_pos, write_size, url, pool, overlap_buffer, &overlap_size);
+                                    extract_links(current_depth, current_pos, write_size, url, overlap_buffer, &overlap_size);
                                 }
                                 current_pos += write_size;
                                 remaining_bytes -= write_size;
@@ -380,16 +558,15 @@ Content* handle_response(SSL *ssl, int sockfd, const char *url, int redirect_cou
             {
                 fwrite(current_pos, 1, remaining_bytes, fp);
                 content->length += remaining_bytes;
-                if (strstr(content->content_type, "text/html"))
+                if (strstr(content->content_type, "text/html") && current_depth + 1 <= MAX_DEPTH)
                 {
-                    extract_links(current_pos, remaining_bytes, url, pool, overlap_buffer, &overlap_size);
+                    extract_links(current_depth, current_pos, remaining_bytes, url, overlap_buffer, &overlap_size);
                 }
             }
         }
     }
 
     end_of_response:
-    
     if (fp) fclose(fp);
     if (content->length == 0) 
     {
@@ -406,7 +583,7 @@ Content* handle_response(SSL *ssl, int sockfd, const char *url, int redirect_cou
     return content;
 }
 
-Content* fetch_url(const char *url, int redirect_count, char *final_url, size_t final_url_size, const char *output_dir, link_storage *pool)
+Content* fetch_url(int current_depth, const char *url, int redirect_count, char *final_url, size_t final_url_size, const char *output_dir)
 {
     if(redirect_count >= MAX_REDIRECTS)
     {
@@ -461,7 +638,7 @@ Content* fetch_url(const char *url, int redirect_count, char *final_url, size_t 
         close(sockfd);
         return NULL;
     }
-    Content* content = handle_response(ssl, sockfd, url, redirect_count, final_url, final_url_size, output_dir, pool );
+    Content* content = handle_response(current_depth, ssl, sockfd, url, redirect_count, final_url, final_url_size, output_dir);
     if (ssl) 
     {
         SSL_free(ssl);
@@ -505,7 +682,7 @@ int normalize_url(const char *base_url, const char *rel_url, char *result, size_
     return ERR_NORMALIZE_URL;
 }
 
-int extract_links(const char *html_content, size_t content_length, const char *base_url, link_storage *pool, char *overlap_buffer, size_t *overlap_size) 
+int extract_links(int current_depth, const char *html_content, size_t content_length, const char *base_url, char *overlap_buffer, size_t *overlap_size) 
 {
     // deal with overlap
     char *combined = malloc(OVERLAP_SIZE + content_length + 1);
@@ -554,6 +731,7 @@ int extract_links(const char *html_content, size_t content_length, const char *b
         if (!link_end || link_end >= end) break;
 
         size_t link_length = link_end - href;
+
         if (link_length > 0 && link_length < MAX_URL_LENGTH) 
         {
             char link[MAX_URL_LENGTH];
@@ -563,14 +741,17 @@ int extract_links(const char *html_content, size_t content_length, const char *b
             char full_url[MAX_URL_LENGTH];
             if (normalize_url(base_url, link, full_url, sizeof(full_url)) == SUCCESS) 
             {
-                if (pool->count < MAX_LINKS && !is_url_visited(full_url, pool)) 
+                sem_wait(mutex);
+                if (shared_pool->count < MAX_LINKS && !is_url_visited(full_url)) 
                 {
-                    strncpy(pool->urls[pool->count], full_url, MAX_URL_LENGTH - 1);
-                    pool->urls[pool->count][MAX_URL_LENGTH - 1] = '\0';
-                    pool->visited[pool->count] = 0;
-                    pool->count++;
+                    strncpy(shared_pool->urls[shared_pool->count], full_url, MAX_URL_LENGTH - 1);
+                    shared_pool->urls[shared_pool->count][MAX_URL_LENGTH - 1] = '\0';
+                    shared_pool->state[shared_pool->count] = HAVEN_VISITED;
+                    shared_pool->depth[shared_pool->count] = current_depth + 1;
+                    shared_pool->count++;
                     printf("Added to pool: %s\n", full_url);  
                 }
+                sem_post(mutex);
             }
         }
         ptr = link_end + 1;
@@ -608,35 +789,40 @@ void create_filename(const char *url, const char *content_type, char *filename, 
     filename[filename_size - 1] = '\0';
 }
 
-int is_url_visited(const char *url, link_storage *pool) 
+int has_unprocessed_urls()
 {
-    for (int i = 0; i < pool->count; i++) 
+    for(int i = 0; i<shared_pool->count; i++)
     {
-        if (strcmp(url, pool->urls[i]) == 0) return (pool->visited[i] == 1) ? 1 : 0;
+        if(shared_pool->state[i] != VISITED && shared_pool->state[i] != VISITED_FAIL) return FOUND;
     }
-    return 0;
+    return NOT_FOUND;
 }
 
-int crawl_level(const char *start_url, const char *output_dir, int current_depth, link_storage *pool)  
+int is_url_visited(const char *url) 
 {
-    if (current_depth > MAX_DEPTH || pool->count >= MAX_VISITED_URLS) return ERR_OUT_OF_RANGE;
+    for (int i = 0; i < shared_pool->count; i++) 
+    {
+        if (strcmp(url, shared_pool->urls[i]) == 0) 
+        {
+            printf("URL %s is %s (status: %d)\n", url, 
+                   (shared_pool->state[i] != HAVEN_VISITED) ? "visited" : "not visited", 
+                   shared_pool->state[i]);
+            return (shared_pool->state[i] != HAVEN_VISITED) ? FOUND : NOT_FOUND;
+        }
+    }
+    printf("URL %s is not in the pool\n", url);
+    return NOT_FOUND;
+}
+
+int crawl_level(const char *start_url, const char *output_dir, int current_depth)  
+{
+    if (shared_pool->count >= MAX_VISITED_URLS) return ERR_OUT_OF_RANGE;
 
     char final_url[MAX_URL_LENGTH];
-    strncpy(final_url, start_url, MAX_URL_LENGTH);
+    strncpy(final_url, start_url, MAX_URL_LENGTH - 1);
     final_url[MAX_URL_LENGTH - 1] = '\0';
 
-    if (is_url_visited(final_url, pool)) 
-    {
-        printf("URL already visited: %s\n", final_url);
-        return ERR_DUPLICATE_URL;
-    }
-
-    strncpy(pool->urls[pool->count], final_url, MAX_URL_LENGTH - 1);
-    pool->urls[pool->count][MAX_URL_LENGTH - 1] = '\0';
-    pool->visited[pool->count] = 1; 
-    pool->count++;
-
-    Content *content = fetch_url(start_url, 0, final_url, MAX_URL_LENGTH, output_dir, pool);
+    Content *content = fetch_url(current_depth, start_url, 0, final_url, MAX_URL_LENGTH, output_dir);
     if (!content) 
     {
         printf("Failed to fetch: %s\n", start_url);
@@ -645,14 +831,6 @@ int crawl_level(const char *start_url, const char *output_dir, int current_depth
     
     printf("Successfully fetched URL: %s\n", final_url);
     printf("Content-Type: %s\n", content->content_type);
-    
-    for (int i = 0; i < pool->count; i++) 
-    {
-        if (!pool->visited[i])
-        {
-            crawl_level(pool->urls[i], output_dir, current_depth + 1, pool);
-        }
-    }
     
     free(content);
 
@@ -667,7 +845,8 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Usage: %s [Start URL] [Output Directory]\n", argv[0]);
         return ERR_ARGUMENTS;
     }
-
+    sem_unlink(SEM_NAME);
+    shm_unlink(SHM_NAME);
     const char *start_url = argv[1];
     const char *output_dir = argv[2];
 
@@ -675,24 +854,50 @@ int main(int argc, char *argv[])
     OpenSSL_add_all_algorithms();
     SSL_load_error_strings();
 
-    struct stat st = {0}; //for file state
-    if (stat(output_dir, &st) == -1) mkdir(output_dir, 0700); //to get file state
-    
-    link_storage pool;
-    for (int i = 0; i < MAX_LINKS; i++) 
+    struct stat st = {0};
+    if (stat(output_dir, &st) == -1) 
     {
-        pool.urls[i][0] = '\0';
-        pool.visited[i] = 0;
+        mkdir(output_dir, 0700);
     }
-    pool.count = 0;
-    int rev=crawl_level(start_url, output_dir, 1, &pool);
-    
+
+    if (init_shared_resources() != SUCCESS) 
+    {
+        fprintf(stderr, "Failed to initialize shared resources\n");
+        return ERR_INIT_SHM;
+    }
+
+    sem_wait(mutex);
+    strncpy(shared_pool->urls[0], start_url, MAX_URL_LENGTH - 1);
+    shared_pool->urls[0][MAX_URL_LENGTH - 1] = '\0';
+    shared_pool->state[0] = HAVEN_VISITED;
+    shared_pool->depth[0] = 0;
+    shared_pool->count = 1;
+    sem_post(mutex);
+
+    if (create_child_processes(output_dir) != SUCCESS) 
+    {
+        printf("Failed to create child processes\n");
+        return ERR_CREAT_CHILD;
+    }
+
+    sem_wait(mutex);
+    shared_pool->ready = 1;  // set ready signal
+    sem_post(mutex);
+
+    parent_process(start_url);
+
+    for (int i = 0; i < NUM_CHILD; i++)
+    {
+        wait(NULL);
+    }
+
+    sem_close(mutex);
+    sem_unlink(SEM_NAME);
+    munmap(shared_pool, sizeof(link_storage));
+    shm_unlink(SHM_NAME);
+
     EVP_cleanup();
     ERR_free_strings();
-    if(rev!=SUCCESS)
-    {
-        printf("Error fail crawl_level \n");
-        return ERR_FAIL_CRAWL_LEVEL;
-    }
+
     return SUCCESS;
 }

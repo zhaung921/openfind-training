@@ -41,7 +41,8 @@
 2. 執行:    
     ```
     ./web_client http://www.openfind.com/ openfind_output
-    ```    
+    ```
+    這會將爬取完的頁面存在output file  
 5. 執行:  
     ```
     make clean

@@ -20,7 +20,7 @@
 #define MAX_LINKS               1000
 #define BUFFER_SIZE             4096
 #define MAX_VISITED_URLS        10000
-#define MAX_DEPTH               2
+#define MAX_DEPTH               1
 #define MAX_RETRIES             3
 #define NUM_CHILD               3
 #define MAX_REDIRECTS           10
@@ -30,9 +30,11 @@
 #define MAX_PATH_SIZE           104
 #define MAX_CONTENT_TYPE_SIZE   256
 #define MAX_WAIT_COUNT          100
-#define HAVEN_VISITED           0
+
 #define NOT_FOUND               0
 #define FOUND                   1
+
+#define HAVEN_VISITED           0
 #define DELIVERING              1
 #define VISITING                2
 #define VISITED                 3
@@ -122,7 +124,7 @@ int init_shared_resources()
         return ERR_MAP_FAIL;
     }
     // initial link_storage
-    memset(shared_pool, 0, sizeof(link_storage));
+    memset(shared_pool, 0, sizeof(link_storage));   
     strcpy(shared_pool->mutex_name, SEM_NAME);
     shared_pool->ready = 0;
     // creat posix semaphore
@@ -181,6 +183,7 @@ void parent_process(const char *start_url)
                 shared_pool->state[i] = DELIVERING;  
                 urls_to_process++;
                 printf("Parent set URL %s (index: %d) to DELIVERING\n", shared_pool->urls[i], i);
+                if(shared_pool->ready == 0) shared_pool->ready = 1;
             }
         }
         sem_post(mutex);
@@ -411,6 +414,7 @@ Content* handle_response(int current_depth, SSL *ssl, int sockfd, const char *ur
     int headers_done = 0;
     char *body_start = NULL;
     int is_chunked = 0;
+    
 
     char overlap_buffer[OVERLAP_SIZE] = {0};
     size_t overlap_size = 0;
@@ -435,6 +439,7 @@ Content* handle_response(int current_depth, SSL *ssl, int sockfd, const char *ur
 
         if (!headers_done) 
         {
+            
             char *header_end = strstr(current_pos, "\r\n\r\n");
             if (header_end) 
             {
@@ -468,7 +473,7 @@ Content* handle_response(int current_depth, SSL *ssl, int sockfd, const char *ur
                 }
                 else if (status_code >= 400) 
                 {
-                    fprintf(stderr, "Error response: %d for URL %s\n", status_code, url);
+                    printf("Error response: %d for URL %s\n", status_code, url);
                     free(content);
                     return NULL;
                 }
@@ -483,7 +488,7 @@ Content* handle_response(int current_depth, SSL *ssl, int sockfd, const char *ur
                     fp = fopen(full_path, "ab");
                     if (!fp) 
                     {
-                        fprintf(stderr, "Failed to open file for writing: %s\n", full_path);
+                        printf("Failed to open file for writing: %s\n", full_path);
                         free(content);
                         return NULL;
                     }
@@ -570,7 +575,7 @@ Content* handle_response(int current_depth, SSL *ssl, int sockfd, const char *ur
     if (fp) fclose(fp);
     if (content->length == 0) 
     {
-        fprintf(stderr, "Failed to receive any data from %s\n", url);
+        printf("Failed to receive any data from %s\n", url);
         free(content);
         return NULL;
     }
@@ -688,7 +693,7 @@ int extract_links(int current_depth, const char *html_content, size_t content_le
     char *combined = malloc(OVERLAP_SIZE + content_length + 1);
     if (!combined) 
     {
-        fprintf(stderr, "Memory allocation failed in extract_links\n");
+        printf("Memory allocation failed in extract_links\n");
         return ERR_FAIL_MALLOC;
     }
     memcpy(combined, overlap_buffer, *overlap_size);
@@ -814,7 +819,7 @@ int is_url_visited(const char *url)
     return NOT_FOUND;
 }
 
-int crawl_level(const char *start_url, const char *output_dir, int current_depth)  
+int crawl_level(const char *start_url, const char *output_dir, int current_depth) 
 {
     if (shared_pool->count >= MAX_VISITED_URLS) return ERR_OUT_OF_RANGE;
 
@@ -842,7 +847,7 @@ int main(int argc, char *argv[])
 {
     if (argc != 3) 
     {
-        fprintf(stderr, "Usage: %s [Start URL] [Output Directory]\n", argv[0]);
+        printf("Usage: %s [Start URL] [Output Directory]\n", argv[0]);
         return ERR_ARGUMENTS;
     }
     sem_unlink(SEM_NAME);
@@ -862,10 +867,10 @@ int main(int argc, char *argv[])
 
     if (init_shared_resources() != SUCCESS) 
     {
-        fprintf(stderr, "Failed to initialize shared resources\n");
+        printf("Failed to initialize shared resources\n");
         return ERR_INIT_SHM;
     }
-
+    //set start url and posh to share memory
     sem_wait(mutex);
     strncpy(shared_pool->urls[0], start_url, MAX_URL_LENGTH - 1);
     shared_pool->urls[0][MAX_URL_LENGTH - 1] = '\0';
@@ -879,17 +884,7 @@ int main(int argc, char *argv[])
         printf("Failed to create child processes\n");
         return ERR_CREAT_CHILD;
     }
-
-    sem_wait(mutex);
-    shared_pool->ready = 1;  // set ready signal
-    sem_post(mutex);
-
     parent_process(start_url);
-
-    for (int i = 0; i < NUM_CHILD; i++)
-    {
-        wait(NULL);
-    }
 
     sem_close(mutex);
     sem_unlink(SEM_NAME);
@@ -898,6 +893,8 @@ int main(int argc, char *argv[])
 
     EVP_cleanup();
     ERR_free_strings();
+    sem_unlink(SEM_NAME);
+    shm_unlink(SHM_NAME);
 
     return SUCCESS;
 }

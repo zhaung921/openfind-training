@@ -82,6 +82,7 @@ typedef struct {
     int count;
     char mutex_name[256];
     int ready;
+    int waiting_child;
 } link_storage;
 
 sem_t *mutex;
@@ -127,6 +128,7 @@ int init_shared_resources()
     memset(shared_pool, 0, sizeof(link_storage));   
     strcpy(shared_pool->mutex_name, SEM_NAME);
     shared_pool->ready = 0;
+    shared_pool->waiting_child = 0;
     // creat posix semaphore
     mutex = sem_open(SEM_NAME, O_CREAT, 0666, 1);
     if (mutex == SEM_FAILED) 
@@ -190,11 +192,19 @@ void parent_process(const char *start_url)
 
         // check finish child
         int status;
+        int sem_status;
         pid_t finished_pid = waitpid(-1, &status, WNOHANG);
         if (finished_pid > 0) 
         {
             active_children--;
-            printf("Child process %d has finished.\n", finished_pid);
+            usleep(100000);
+            sem_getvalue(mutex,&sem_status);
+            if(__sync_fetch_and_add(&shared_pool->waiting_child, 0) >= active_children && sem_status == 0 )
+            {
+                printf("Child process %d could be crash and locked, reset mutex\n", finished_pid);
+                sem_post(mutex);
+            }
+            else printf("Child process %d has finished.\n", finished_pid);
         }
     }
     printf("All URLs have been processed.\n");
@@ -209,7 +219,10 @@ void child_process(int child_id, const char *output_dir)
         char url[MAX_URL_LENGTH];
         int url_index = -1;
         int current_depth = -1;
+       __sync_fetch_and_add(&shared_pool->waiting_child, 1);
+
         sem_wait(mutex);
+         __sync_fetch_and_sub(&shared_pool->waiting_child, 1);
         for (int i = 0; i < shared_pool->count && i < MAX_LINKS; i++) 
         {
             if (shared_pool->state[i] == DELIVERING && shared_pool->depth[i] <= MAX_DEPTH) 
@@ -237,7 +250,9 @@ void child_process(int child_id, const char *output_dir)
         printf("Child %d processing URL: %s\n", child_id, url);
         int result = crawl_level(url, output_dir, current_depth);
 
+        __sync_fetch_and_add(&shared_pool->waiting_child, 1);
         sem_wait(mutex);
+        __sync_fetch_and_sub(&shared_pool->waiting_child, 1);
         if (result == SUCCESS) 
         {
             shared_pool->state[url_index] = VISITED;
@@ -746,7 +761,9 @@ int extract_links(int current_depth, const char *html_content, size_t content_le
             char full_url[MAX_URL_LENGTH];
             if (normalize_url(base_url, link, full_url, sizeof(full_url)) == SUCCESS) 
             {
+                __sync_fetch_and_add(&shared_pool->waiting_child, 1);
                 sem_wait(mutex);
+                __sync_fetch_and_sub(&shared_pool->waiting_child, 1);
                 if (shared_pool->count < MAX_LINKS && !is_url_visited(full_url)) 
                 {
                     strncpy(shared_pool->urls[shared_pool->count], full_url, MAX_URL_LENGTH - 1);
@@ -805,6 +822,7 @@ int has_unprocessed_urls()
 
 int is_url_visited(const char *url) 
 {
+    int reval = 0 ;
     for (int i = 0; i < shared_pool->count; i++) 
     {
         if (strcmp(url, shared_pool->urls[i]) == 0) 
@@ -812,11 +830,11 @@ int is_url_visited(const char *url)
             printf("URL %s is %s (status: %d)\n", url, 
                    (shared_pool->state[i] != HAVEN_VISITED) ? "visited" : "not visited", 
                    shared_pool->state[i]);
-            return (shared_pool->state[i] != HAVEN_VISITED) ? FOUND : NOT_FOUND;
+            reval =  (shared_pool->state[i] != HAVEN_VISITED) ? FOUND : NOT_FOUND;
         }
     }
     printf("URL %s is not in the pool\n", url);
-    return NOT_FOUND;
+    return reval;
 }
 
 int crawl_level(const char *start_url, const char *output_dir, int current_depth) 

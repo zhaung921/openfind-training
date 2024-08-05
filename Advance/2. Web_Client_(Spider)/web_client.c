@@ -792,7 +792,7 @@ void create_filename(const char *url, const char *content_type, char *filename, 
     
     strncpy(filename + i, extension, filename_size - i);
     filename[filename_size - 1] = '\0';
-}
+}    
 
 int has_unprocessed_urls()
 {
@@ -890,11 +890,8 @@ int main(int argc, char *argv[])
     sem_unlink(SEM_NAME);
     munmap(shared_pool, sizeof(link_storage));
     shm_unlink(SHM_NAME);
-
     EVP_cleanup();
     ERR_free_strings();
-    sem_unlink(SEM_NAME);
-    shm_unlink(SHM_NAME);
 
     return SUCCESS;
 }
